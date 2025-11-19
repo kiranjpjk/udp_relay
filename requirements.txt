@@ -1,1 +1,198 @@
 # empty but required
+# StarC2 Scapy Implementation
+# Files included in this single code document:
+# 1) ca_keystream.py  - Cellular Automata encode/decode helpers
+# 2) satellite_sender.py - Build satellite-mimic frame and send via ICMP
+# 3) satellite_receiver.py - Sniff ICMP, parse frames, decode CA payload
+# 4) requirements.txt - Python deps
+# 5) RUN_INSTRUCTIONS - How to run in VS Code / Windows / Linux
+# Reference report (uploaded): sandbox:/mnt/data/STAR_C2_PROJECT_PHASE_1[1]Kiran.pdf
+
+# ----------------------------
+# ca_keystream.py
+# ----------------------------
+import numpy as np
+
+def rule_to_table(rule_number: int):
+    if not (0 <= rule_number <= 255):
+        raise ValueError("rule_number 0-255")
+    return [(rule_number >> i) & 1 for i in range(7, -1, -1)]
+
+def ca_step(state: np.ndarray, table):
+    # circular boundary
+    left = np.roll(state, 1)
+    right = np.roll(state, -1)
+    idx = (left << 2) | (state << 1) | right
+    next_state = np.array([table[7 - int(i)] for i in idx], dtype=np.uint8)
+    return next_state
+
+def ca_keystream(rule_number:int, seed_bytes:bytes, n_bits:int):
+    table = rule_to_table(rule_number)
+    state = np.unpackbits(np.frombuffer(seed_bytes, dtype=np.uint8))
+    center_idx = state.size // 2
+    out = np.empty(n_bits, dtype=np.uint8)
+    for i in range(n_bits):
+        out[i] = state[center_idx]
+        state = ca_step(state, table)
+    return out
+
+def bits_from_string(s: str):
+    return np.unpackbits(np.frombuffer(s.encode('utf8'), dtype=np.uint8))
+
+def string_from_bits(bits: np.ndarray):
+    nbytes = (bits.size // 8)
+    if nbytes == 0:
+        return ''
+    bits = bits[:nbytes*8]
+    arr = np.packbits(bits.astype(np.uint8))
+    return arr.tobytes().decode('utf8', errors='ignore')
+
+def ca_encode_message(message: str, rule:int, seed_bytes:bytes):
+    plaintext_bits = bits_from_string(message)
+    ks = ca_keystream(rule, seed_bytes, plaintext_bits.size)
+    encoded = np.bitwise_xor(plaintext_bits, ks)
+    # header: marker + rule + seed length + seed bytes
+    header = b'CAv1' + bytes([rule, len(seed_bytes)]) + seed_bytes
+    return encoded, header
+
+def ca_decode_bits(encoded_bits: np.ndarray, rule:int, seed_bytes:bytes):
+    ks = ca_keystream(rule, seed_bytes, encoded_bits.size)
+    plain_bits = np.bitwise_xor(encoded_bits, ks)
+    return string_from_bits(plain_bits)
+
+# ----------------------------
+# satellite_sender.py
+# ----------------------------
+"""
+Usage: python satellite_sender.py <receiver_ip> "Optional message"
+Sends a single ICMP packet with a satellite-like frame.
+"""
+import sys
+import struct
+import time
+import numpy as np
+from scapy.all import IP, ICMP, Raw, send
+from ca_keystream import ca_encode_message
+
+SYNC = 0x1ACFFC1D
+FRAME_ID_COVERT = 0xA1
+
+
+def build_satellite_frame(msg, rule=30, seed=b'\x12\x34\x56\x78'):
+    frame = struct.pack(">I", SYNC)
+    frame += struct.pack("B", FRAME_ID_COVERT)
+    frame += struct.pack(">I", int(time.time()))
+    encoded_bits, header = ca_encode_message(msg, rule, seed)
+    payload = header + np.packbits(encoded_bits).tobytes()
+    frame += payload
+    return frame
+
+
+def send_covert_frame(dst_ip, msg="HELLO FROM STARC2"):
+    frame = build_satellite_frame(msg)
+    pkt = IP(dst=dst_ip)/ICMP()/Raw(load=frame)
+    send(pkt, verbose=False)
+    print(f"[+] Sent covert satellite-mimic ICMP to {dst_ip} (len={len(frame)} bytes)")
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print("Usage: python satellite_sender.py <receiver_ip> [message]")
+        sys.exit(1)
+    dst = sys.argv[1]
+    message = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else "HELLO FROM STARC2"
+    send_covert_frame(dst, message)
+
+# ----------------------------
+# satellite_receiver.py
+# ----------------------------
+"""
+Usage: python satellite_receiver.py
+Sniffs ICMP packets on the local interface and attempts to parse StarC2 frames.
+"""
+from scapy.all import sniff
+import struct
+import numpy as np
+from ca_keystream import ca_decode_bits
+
+SYNC = 0x1ACFFC1D
+
+
+def process_frame(data: bytes):
+    if len(data) < 9:
+        return None
+    sync = struct.unpack(">I", data[:4])[0]
+    if sync != SYNC:
+        return None
+    frame_id = data[4]
+    timestamp = struct.unpack(">I", data[5:9])[0]
+    payload = data[9:]
+    # parse header
+    if len(payload) < 6:
+        # header (marker+rule+len) missing
+        return None
+    marker = payload[:4]
+    if marker != b'CAv1':
+        return None
+    rule = payload[4]
+    seed_len = payload[5]
+    if len(payload) < 6 + seed_len:
+        return None
+    seed = payload[6:6+seed_len]
+    encoded_bytes = payload[6+seed_len:]
+    if encoded_bytes.size if isinstance(encoded_bytes, np.ndarray) else len(encoded_bytes) == 0:
+        # nothing to decode
+        return ''
+    encoded_bits = np.unpackbits(np.frombuffer(encoded_bytes, dtype=np.uint8))
+    try:
+        decoded = ca_decode_bits(encoded_bits, rule, seed)
+    except Exception as e:
+        decoded = f"<decode error: {e}>"
+    return {
+        'frame_id': frame_id,
+        'timestamp': timestamp,
+        'decoded': decoded
+    }
+
+
+def pkt_handler(pkt):
+    if pkt.haslayer('ICMP') and pkt.haslayer('Raw'):
+        data = bytes(pkt['Raw'].load)
+        info = process_frame(data)
+        if info:
+            print('\n=== StarC2 Frame ===')
+            print('Frame ID:', hex(info['frame_id']))
+            print('Timestamp:', info['timestamp'])
+            print('Decoded payload:', info['decoded'])
+
+
+if __name__ == '__main__':
+    print("[+] Starting StarC2 receiver (sniffing ICMP). Press Ctrl+C to stop")
+    sniff(filter="icmp", prn=pkt_handler)
+
+# ----------------------------
+# requirements.txt
+# ----------------------------
+# scapy and numpy are required
+scapy
+numpy
+
+# ----------------------------
+# RUN_INSTRUCTIONS (summary)
+# ----------------------------
+# 1) Place all files in one folder in VS Code: ca_keystream.py, satellite_sender.py, satellite_receiver.py
+# 2) Install dependencies in terminal:
+#    pip install -r requirements.txt
+# 3) Find receiver IP on LAN (receiver machine):
+#    - Windows: ipconfig
+#    - Linux: ifconfig or ip addr
+# 4) On receiver machine run (needs admin/root to sniff):
+#    python satellite_receiver.py
+# 5) On sender machine run (needs admin/root to send raw packets):
+#    python satellite_sender.py <receiver_ip> "Your Message"
+# 6) Open Wireshark on receiver machine, filter: icmp
+# 7) You should see ICMP frames with payload starting with: 1A CF FC 1D (SYNC)
+# 8) For file transfer, split file into chunks and send sequential ICMP frames with sequence numbering in the payload.
+
+# Reference project report (Phase I):
+# sandbox:/mnt/data/STAR_C2_PROJECT_PHASE_1[1]Kiran.pdf
